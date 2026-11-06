@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/ShuW7/MOD-Tools",
+  "submoduleBranches": {
+    "minhook": "master",
+    "UnityPy": "master",
+    "Ark-Unpacker": "v5.x"
+  },
+  "unityReference": "https://github.com/Unity-Technologies/UnityCsReference/blob/2021.3/Modules/AssetBundle/Managed/AssetBundle.bindings.cs",
+  "audioPolicy": "Voice lines are replaced by appending uncompressed PCM16 FSB5 banks to the bundle resource. AudioClip decoding and the FMOD SDK remain excluded; existing M4A mods are not supported by the experimental source loader.",
+  "submoduleRepositories": {
+    "minhook": "QAQ-Revival/minhook",
+    "UnityPy": "QAQ-Revival/UnityPy",
+    "Ark-Unpacker": "QAQ-Revival/Ark-Unpacker"
+  }
+}
