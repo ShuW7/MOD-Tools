@@ -11,17 +11,12 @@ import re
 import sys
 from pathlib import Path
 
-import UnityPy
-from UnityPy.enums import CompressionFlags
-from UnityPy.helpers import CompressionHelper
-from lz4ak import decompress_lz4ak
 import appearance_assets as appearance
 import ui_cosmetics as ui
 import voice
 import ab_mod
 from pc_layout import CHARACTER, RESOURCE_MANIFEST, character_hints, current_bundles, game_roots, read_bindings, relative_path
 
-CompressionHelper.DECOMPRESSION_MAP[CompressionFlags.LZHAM] = decompress_lz4ak
 MAX_BUNDLE = 512 * 1024 * 1024
 BUNDLE_EXTS = {".ab", ".bundle", ".unity3d"}
 
@@ -57,7 +52,7 @@ def bundle_records(file, return_env=False):
     if file.stat().st_size > MAX_BUNDLE:
         raise ValueError("Bundle exceeds 512 MiB")
     # Loading bytes keeps UnityPy dependency resolution within the supplied AB.
-    env = UnityPy.load(file.read_bytes())
+    env = appearance.arknights_unity().load(file.read_bytes())
     records = []
     platforms = sorted({int(asset.target_platform) for asset in env.assets})
     skipped = []

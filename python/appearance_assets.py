@@ -141,7 +141,7 @@ def page_sort_key(relative):
     return (0, int(match.group(1))) if match else (1, 0)
 
 
-def _register_lzham():
+def arknights_unity():
     """Teach UnityPy the block format used by every Arknights PC bundle."""
     import UnityPy
     from UnityPy.enums import CompressionFlags
@@ -159,7 +159,7 @@ def read_page(file):
 
     Returns ``[(container, family, folder, asset, target, path_id)]``.
     """
-    UnityPy = _register_lzham()
+    UnityPy = arknights_unity()
     env = UnityPy.load(str(file))
     bundle = None
     textures = {}

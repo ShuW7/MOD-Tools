@@ -13,6 +13,35 @@ from pc_layout import _bundle_index
 
 
 class ScopedReload(unittest.TestCase):
+    def test_prebuilt_operator_mod_never_searches_loose_resources(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('QAQR_TEST_TMP')) as directory:
+            root = Path(directory)
+            game = root / 'game' / 'Arknights.exe'
+            game.parent.mkdir()
+            game.touch()
+            bundle_dir = 'Arknights_Data/StreamingAssets/AB/Windows/arts/dynchars'
+            name = 'char_4098_vvana_epoque#59.ab'
+            original = game.parent / bundle_dir / name
+            original.parent.mkdir(parents=True)
+            original.write_bytes(b'UnityFS original')
+            source = root / 'Resources'
+            mod = source / 'mod-id'
+            mod.mkdir(parents=True)
+            (mod / 'mod.ini').write_text(f'[mod]\ntype=assetbundle\nkey_root={bundle_dir}\n')
+            (mod / name).write_bytes(b'UnityFS replacement')
+            args = dict(gamePath=str(game), source=str(source), characterIds=['char_4098_vvana'])
+            with patch('bundle_builder.current_bundles', side_effect=AssertionError('unexpected discovery')), \
+                 patch('bundle_builder.bundle_records', side_effect=AssertionError('unexpected parsing')):
+                full = build_bundles(dict(args, output=str(root / 'full')))
+                enabled = build_bundles(dict(args, scopeSource=str(mod), output=str(root / 'enabled')))
+                self.assertEqual(full['bundles'], enabled['bundles'])
+                self.assertEqual(len(full['bundles']), 1)
+                bundle = full['bundles'][0]
+                disabled = mod.rename(root / 'DISABLED_mod')
+                result = build_bundles(dict(args, scopeSource=str(disabled), affectedBundles=[bundle['logical']], output=str(root / 'disabled')))
+                self.assertEqual(result['bundles'], [])
+                self.assertEqual(result['removedBundles'], [dict(source=bundle['source'], logical=bundle['logical'], sourceSha256=bundle['sourceSha256'])])
+
     def test_disabled_mod_removes_only_its_bundle(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('QAQR_TEST_TMP')) as directory:
             root = Path(directory)

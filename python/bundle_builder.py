@@ -4,17 +4,15 @@ import io
 import json
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
-import UnityPy
-from PIL import Image
-from UnityPy.enums import TextureFormat
 import ab_mod
 import appearance_assets as appearance
 import ui_cosmetics as ui
 import voice
 from worker import BUNDLE_EXTS, bundle_records, normalized, source_files, ui_targets_for
-from pc_layout import CHARACTER, character_hints, current_bundles, game_roots, read_bindings, relative_path
+from pc_layout import CHARACTER, character_hints, current_bundles, game_roots, read_bindings, relative_path, requested_bundles
 
 
 def digest(file):
@@ -31,6 +29,7 @@ def appearance_fit(image, record):
     """
     native = tuple(record.get("appearanceNativeSize") or ())
     if native and image.size != native:
+        from PIL import Image
         if native[0] * native[1] > 64 * 1024 * 1024:
             raise ValueError("Texture is too large")
         return image.resize(native, Image.Resampling.LANCZOS)
@@ -52,6 +51,7 @@ def merge_alpha_channel(image, alpha_file):
     """Apply a Mod's separate `[alpha]` map to an illustration image."""
     if not alpha_file:
         return image
+    from PIL import Image
     with Image.open(alpha_file) as alpha_image:
         alpha = alpha_image.convert("RGB").getchannel("R")
         if alpha.size != image.size:
@@ -161,6 +161,9 @@ def build_bundles(request):
     ab_entries, ab_removals = asset_bundle_entries(source, game, scoped, scope)
     # Even a scoped patch must leave every other enabled AssetBundle Mod alone.
     known_entries = asset_bundle_entries(source, game, False, None)[0] if scoped else ab_entries
+    for entry in ab_entries:
+        if not entry.get('source'):
+            raise ValueError('AssetBundle target is missing from the game: ' + entry['game_relative'])
     ab_files = {entry['file'].resolve() for entry in known_entries + ab_entries + ab_removals}
     ab_all_sources = {str(Path(game.parent / entry['source']).resolve()) for entry in known_entries if entry.get('source')}
     inputs = source_files(source, max_files=100000)
@@ -256,7 +259,7 @@ def build_bundles(request):
         if scope_items and all(bundle for _, bundle in scope_items):
             for item in scope_items:
                 scope_matches[item].add(item[1].casefold())
-        else:
+        elif scope_items:
             for relative, original in current_bundles(roots, scope_ids, scope_requested):
                 records, _, _ = bundle_records(original)
                 keys = {normalized(record['target']) for record in records}
@@ -268,13 +271,32 @@ def build_bundles(request):
             raise ValueError('The selected Mod needs unambiguous current PC resource bindings; diagnose and convert it first')
         for matches in scope_matches.values():
             affected.update(matches)
+        # Whole-bundle routes use game-relative paths. They already have exact
+        # targets and need no character discovery. On removal a loose Mod may
+        # still need the original bundle rebuilt underneath the replacement.
+        for entry in ab_entries + ab_removals:
+            affected.discard(entry['game_relative'].casefold())
+        if resources and ab_removals:
+            bound = {item['bundle'].casefold() if item['bundle'] else None for item in resources}
+            for entry in ab_removals:
+                if entry.get('source'):
+                    original = game.parent / entry['source']
+                    for root in roots:
+                        if original.is_relative_to(root):
+                            logical = original.relative_to(root).as_posix().casefold()
+                            if None in bound or logical in bound:
+                                affected.add(logical)
+                            break
         requested = sorted(affected)
     loaded = []
     # One Mod image can map to several textures (legacy roles such as shareBg);
     # track matches per resource entry, not per file.
     matches = {id(item): [] for item in resources if not scoped or (item['bundle'] and item['bundle'].casefold() in affected)}
     removed = []
-    selected_originals = current_bundles(roots, set() if scoped or (resources and all(item['bundle'] for item in resources)) else ids, requested)
+    if scoped or all(item['bundle'] for item in resources):
+        selected_originals = sorted(requested_bundles(roots, set(requested)), key=lambda item: item[0].casefold())
+    else:
+        selected_originals = current_bundles(roots, ids, requested)
     if scoped and affected.difference(relative.casefold() for relative, _ in selected_originals):
         raise ValueError('A previously loaded game bundle is missing; restart and prepare Mods against the current game version')
     for relative, original in selected_originals:
@@ -288,7 +310,7 @@ def build_bundles(request):
                     matches.setdefault(id(item), []).append((relative, record['target']))
         if selected:
             loaded.append((relative, original, before_hash, selected))
-        elif scoped:
+        elif scoped and str(original.resolve()) not in ab_all_sources:
             removed.append({'source': original.relative_to(game.parent).as_posix(), 'sourceSha256': before_hash, 'logical': relative})
     # A prebuilt AssetBundle replaces the whole bundle: it takes precedence and
     # the resource rebuild for the same source is dropped.
@@ -302,12 +324,13 @@ def build_bundles(request):
             kept.append(item)
         loaded = kept
     removed_sources = {item['source'].casefold() for item in removed}
+    rebuilt_sources = {original.relative_to(game.parent).as_posix().casefold() for _, original, _, _ in loaded}
     for entry in ab_removals:
         if not entry.get('source'):
             continue
         path = game.parent / entry['source']
         relative = path.relative_to(game.parent).as_posix()
-        if relative.casefold() in removed_sources:
+        if relative.casefold() in removed_sources or relative.casefold() in rebuilt_sources:
             continue
         removed_sources.add(relative.casefold())
         removed.append({'source': relative, 'sourceSha256': digest(path), 'logical': entry['game_relative']})
@@ -322,6 +345,8 @@ def build_bundles(request):
         stage = Path(temporary)
         bundles = []
         for relative, original, before_hash, targets in loaded:
+            from PIL import Image
+            from UnityPy.enums import TextureFormat
             if digest(original) != before_hash:
                 raise ValueError('Game resources changed during preparation')
             records, _, platforms, env = bundle_records(original, return_env=True)
@@ -373,7 +398,7 @@ def build_bundles(request):
                 raise ValueError("Unexpected bundle root layout")
             encoded = next(iter(env.files.values())).save(packer="lz4")
             # Reparse every generated package and preserve the PC object graph.
-            checked = UnityPy.load(encoded)
+            checked = appearance.arknights_unity().load(encoded)
             if sorted((obj.path_id, obj.type.name) for obj in checked.objects) != before_ids:
                 raise ValueError("Generated bundle object identity changed")
             if sorted({int(asset.target_platform) for asset in checked.assets}) != platforms:
@@ -455,5 +480,13 @@ def build_bundles(request):
         for bundle in removed:
             lines.append('\t'.join(['REMOVE', bundle['source'], bundle['sourceSha256']]))
         (stage / "manifest.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        stage.rename(output)
+        # Windows may briefly hold a newly written bundle open while scanning it.
+        for attempt in range(6):
+            try:
+                stage.rename(output)
+                break
+            except OSError as error:
+                if getattr(error, 'winerror', None) not in (5, 32, 33) or output.exists() or attempt == 5:
+                    raise
+                time.sleep(0.025 * (attempt + 1))
         return {"success": True, "bundleCount": len(bundles), "resourceCount": len(matches), "bundles": bundles, "assetBundles": ab_bundles, "shadowedAssetBundles": shadowed, "removedBundles": removed, "objectAndResourceRoundTripVerified": True, "runtimeValidated": False}
