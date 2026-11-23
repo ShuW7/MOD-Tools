@@ -158,6 +158,14 @@ reload interfaces retains ordinary file redirection and reports reload as
 unsupported. No game compatibility or visual validation is implied by a reload
 acknowledgement.
 
+An asynchronous bundle request keeps its previous bundle readable until the
+request's result is collected. Duplicate-load failures resolve through the
+tracked live bundle, and repeated result reads retain the resolved object.
+Releasing an old wrapper never forwards an unload to its replacement. Asset
+reads and replacement swaps are serialized per source bundle; an unloaded
+wrapper is reopened before reuse. The synthetic runtime tests exercise these
+paths and replacement-load rollback without starting the game.
+
 Compilation, manifest tests and round-trip bundle checks do not establish game
 compatibility. The current implementation is experimental until exercised in the
 target game. `gameRuntimeValidated` remains false in generated component metadata.

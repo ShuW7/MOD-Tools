@@ -131,15 +131,27 @@ struct Loaded {
     std::shared_ptr<Loaded> successor;
     std::shared_ptr<Managed> successorPin;
     bool unloaded = false;
-    std::mutex reloadMutex;
 };
-struct Pending { std::shared_ptr<Managed> object; std::wstring source; std::shared_ptr<Target> target; };
+struct Pending { std::shared_ptr<Managed> object; std::wstring source; std::shared_ptr<Target> target; std::shared_ptr<Managed> resolved; };
 std::map<std::wstring, std::shared_ptr<Target>> targets;
 std::map<void*, std::shared_ptr<Loaded>> loaded;
 std::map<std::wstring, std::vector<std::weak_ptr<Loaded>>> sourceBundles;
 size_t remembered = 0;
 std::map<void*, Pending> creating;
 std::map<std::wstring, std::vector<Pending>> assetRequests;
+std::map<std::wstring, std::recursive_mutex> sourceLocks;
+
+std::recursive_mutex& sourceLock(const std::wstring& source) {
+    std::lock_guard lock(stateMutex);
+    return sourceLocks[source];
+}
+std::shared_ptr<Loaded> latest(const std::wstring& source) {
+    std::lock_guard lock(stateMutex);
+    auto found = sourceBundles.find(source);
+    if (found != sourceBundles.end()) for (auto it = found->second.rbegin(); it != found->second.rend(); ++it)
+        if (auto entry = it->lock(); entry && !entry->successor && entry->object->get()) return entry;
+    return nullptr;
+}
 
 std::shared_ptr<Target> makeTarget(const ark::fs::path& file, const std::string& version) {
     RuntimeThread thread;
@@ -203,7 +215,7 @@ std::shared_ptr<Loaded> known(void* object) {
 }
 bool busy(const std::wstring& source) {
     std::vector<Pending> pending;
-    { std::lock_guard lock(stateMutex); auto found = assetRequests.find(source); if (found != assetRequests.end()) pending = found->second; for (const auto& [_, request] : creating) if (request.source == source) pending.push_back(request); }
+    { std::lock_guard lock(stateMutex); auto found = assetRequests.find(source); if (found != assetRequests.end()) pending = found->second; for (const auto& [_, request] : creating) if (request.source == source && !request.resolved) pending.push_back(request); }
     for (const auto& request : pending) {
         if (request.source != source) continue;
         auto object = request.object->get();
@@ -225,9 +237,10 @@ bool retire(const std::shared_ptr<Loaded>& entry) {
 }
 void* currentBundle(const std::shared_ptr<Loaded>& entry) {
     auto desired = targetFor(entry->source);
-    if (same(desired, entry->target)) return entry->object->get();
-    std::unique_lock lock(entry->reloadMutex, std::try_to_lock);
-    if (!lock || !retire(entry)) return entry->object->get();
+    if (same(desired, entry->target) && !entry->unloaded) return entry->object->get();
+    // Check immutable patch files before releasing a still usable bundle.
+    if (desired && (!ark::fs::is_regular_file(desired->file) || ark::hasLink(desired->file))) return entry->unloaded ? nullptr : entry->object->get();
+    if (!retire(entry)) return entry->unloaded ? nullptr : entry->object->get();
     struct Guard { Guard() { internalLoad = true; } ~Guard() { internalLoad = false; } } guard;
     auto load = [&](const std::shared_ptr<Target>& target) {
         auto chosen = target ? target : makeTarget(entry->source, "");
@@ -241,7 +254,7 @@ void* currentBundle(const std::shared_ptr<Loaded>& entry) {
     if (auto result = load(desired)) return result;
     auto result = load(entry->target);
     ark::writeStatus(statusDirectory, "reload-deferred", "Changed bundle load failed; previous resources were retained. Re-enter the character view to retry.");
-    return result ? result : entry->object->get();
+    return result;
 }
 void* loadFile(LoadBundle original, void* input, uint32_t crc, uint64_t offset, bool async) {
     RuntimeThread thread;
@@ -249,15 +262,13 @@ void* loadFile(LoadBundle original, void* input, uint32_t crc, uint64_t offset, 
     if (internalLoad) return original(input, crc, offset);
     auto source = sourceFor(input, offset);
     if (source.empty()) return original(input, crc, offset);
+    std::lock_guard routeLock(sourceLock(source));
     auto target = targetFor(source);
     if (!reloadAvailable) return original(target ? target->name->get() : input, target ? 0 : crc, offset);
-    std::shared_ptr<Loaded> previous;
-    { std::lock_guard lock(stateMutex); auto found = sourceBundles.find(source); if (found != sourceBundles.end()) for (auto it = found->second.rbegin(); it != found->second.rend(); ++it) if (auto entry = it->lock(); entry && !entry->successor && entry->object->get()) { previous = entry; break; } }
-    if (previous && !same(target, previous->target)) {
-        if (!async) return currentBundle(previous);
-        std::unique_lock lock(previous->reloadMutex, std::try_to_lock);
-        if (!lock || !retire(previous)) target = previous->target;
-    }
+    auto previous = latest(source);
+    if (previous && !async) return currentBundle(previous);
+    // Never retire here for an asynchronous load: cached asset reads can arrive
+    // before get_assetBundle. Keep the old bundle readable until completion.
     if (target && (!ark::fs::is_regular_file(target->file) || ark::hasLink(target->file))) target = nullptr;
     auto result = original(target ? target->name->get() : input, target ? 0 : crc, offset);
     if (!result) return result;
@@ -274,18 +285,35 @@ void* loadAsync(void* f, uint32_t c, uint64_t o) { try { return loadFile(origina
 void* getBundle(void* request) {
     RuntimeThread thread;
     if (!thread) return originalGetBundle(request);
-    auto result = originalGetBundle(request);
     Pending pending;
-    { std::lock_guard lock(stateMutex); auto found = creating.find(request); if (found == creating.end()) return result; pending = found->second; creating.erase(found); }
-    remember(result, pending.source, pending.target);
+    { std::lock_guard lock(stateMutex); auto found = creating.find(request); if (found != creating.end()) pending = found->second; }
+    if (!pending.object || pending.object->get() != request) return originalGetBundle(request);
+    std::lock_guard routeLock(sourceLock(pending.source));
+    { std::lock_guard lock(stateMutex); pending = creating.at(request); }
+    if (pending.resolved) return pending.resolved->get();
+    auto result = originalGetBundle(request);
+    // Unity may reject a duplicate bundle while its previous version is live.
+    // Complete the switch now, after the async request has finished, and retain
+    // that result for repeated reads of this request's assetBundle property.
+    if (result) remember(result, pending.source, pending.target);
+    if (auto previous = latest(pending.source)) result = currentBundle(previous);
+    if (result) {
+        auto pin = std::make_shared<Managed>(result);
+        std::lock_guard lock(stateMutex);
+        creating.at(request).resolved = std::move(pin);
+    }
     return result;
 }
 void unload(void* object, bool destroyObjects) {
     RuntimeThread thread;
     if (!thread) { originalUnload(object, destroyObjects); return; }
-    auto entry = known(object);
-    if (entry && !internalLoad) object = entry->object->get();
-    { std::lock_guard lock(stateMutex); auto found = loaded.find(object); if (found != loaded.end() && found->second->unloaded) return; }
+    std::shared_ptr<Loaded> entry;
+    { std::lock_guard lock(stateMutex); auto found = loaded.find(object); if (found != loaded.end() && found->second->object->get() == object) entry = found->second; }
+    if (!entry) { originalUnload(object, destroyObjects); return; }
+    std::lock_guard routeLock(sourceLock(entry->source));
+    // Unload belongs to this wrapper, never to its replacement. A delayed
+    // release of an old wrapper must not destroy newly loaded resources.
+    if (entry->unloaded) return;
     originalUnload(object, destroyObjects);
     std::lock_guard lock(stateMutex);
     auto found = loaded.find(object);
@@ -295,7 +323,13 @@ void* asset(LoadAsset original, void* bundle, void* name, void* type, bool async
     RuntimeThread thread;
     if (!thread) return original(bundle, name, type);
     auto entry = known(bundle);
-    if (entry) if (auto current = currentBundle(entry)) bundle = current;
+    if (!entry) return original(bundle, name, type);
+    std::lock_guard routeLock(sourceLock(entry->source));
+    entry = known(bundle);
+    if (entry) {
+        bundle = currentBundle(entry);
+        if (!bundle) return nullptr;
+    }
     auto result = original(bundle, name, type);
     if (async && result && entry) {
         Pending request{std::make_shared<Managed>(result, true), entry->source, nullptr};

@@ -23,6 +23,9 @@ std::map<uint32_t, bool> weakHandles;
 std::mutex handleMutex;
 uint32_t nextHandle = 1;
 std::map<std::wstring, int> reads;
+std::map<std::wstring, std::wstring> logicalFiles;
+std::vector<Bundle*> bundles;
+std::wstring rejectedFile;
 uint32_t retain(void* object, bool) { requireThread(); std::lock_guard lock(handleMutex); auto id = nextHandle++; handles[id] = object; return id; }
 void* target(uint32_t id) { requireThread(); std::lock_guard lock(handleMutex); return handles.contains(id) ? handles[id] : nullptr; }
 void release(uint32_t id) { requireThread(); std::lock_guard lock(handleMutex); handles.erase(id); }
@@ -35,8 +38,18 @@ void collect(void* object) {
 void* load(void* name, uint32_t, uint64_t) {
     auto file = ark::fs::path(*static_cast<std::wstring*>(name));
     if (!ark::fs::exists(file)) return nullptr;
+    auto key = ark::normalized(file);
+    if (key == rejectedFile) return nullptr;
+    auto logical = logicalFiles.contains(key) ? logicalFiles.at(key) : key;
+    for (auto bundle : bundles) {
+        auto other = ark::normalized(bundle->file);
+        if (logicalFiles.contains(other)) other = logicalFiles.at(other);
+        if (!bundle->unloaded && logical == other) return nullptr;
+    }
     reads[ark::normalized(file)]++;
-    return new Bundle{file};
+    auto bundle = new Bundle{file};
+    bundles.push_back(bundle);
+    return bundle;
 }
 void* loadAsync(void* name, uint32_t crc, uint64_t offset) { return new Request{false, static_cast<Bundle*>(load(name, crc, offset))}; }
 void* get(void* request) { auto value = static_cast<Request*>(request); value->done = true; return value->bundle; }
@@ -103,6 +116,7 @@ int wmain(int argc, wchar_t** argv) {
         auto patch = [&](const std::wstring& id, const ark::fs::path& source, bool remove = false, bool corrupt = false) {
             auto directory = statusDirectory / L"reloads" / id; ark::fs::create_directories(directory);
             auto replacement = directory / L"changed.ab"; std::ofstream(replacement) << ark::utf8(id);
+            fixture::logicalFiles[ark::normalized(replacement)] = ark::normalized(source);
             auto file = directory / L"manifest.tsv";
             std::ofstream stream(file, std::ios::binary);
             stream << "QAQR-ARKNIGHTS-PATCH\t1\nGAME\t" << ark::utf8(executable.wstring()) << '\n';
@@ -119,6 +133,8 @@ int wmain(int argc, wchar_t** argv) {
         auto newA = static_cast<fixture::Bundle*>(::loadAsset(oldA, nullptr, nullptr));
         check(newA->file == first.parent_path() / L"changed.ab", "Cached bundle did not follow its replacement");
         check(oldA->unloaded && !oldA->destroyed, "Displayed objects were destroyed");
+        ::unload(oldA, true);
+        check(!newA->unloaded && !newA->destroyed, "Releasing a retired wrapper destroyed its live replacement");
         std::exception_ptr workerError;
         std::thread worker([&] {
             try {
@@ -144,6 +160,25 @@ int wmain(int argc, wchar_t** argv) {
         auto third = patch(L"third", c); send(third);
         auto oldC = ::getBundle(pendingC);
         check(static_cast<fixture::Bundle*>(::loadAsset(oldC, nullptr, nullptr))->file == third.parent_path() / L"changed.ab", "Async bundle request was not tracked");
+        auto beforeAsync = static_cast<fixture::Bundle*>(::loadAsset(oldA, nullptr, nullptr));
+        auto fourth = patch(L"async-switch", a); send(fourth);
+        auto switching = ::loadAsync(name(a), 0, 0);
+        check(switching && !beforeAsync->unloaded, "Async switch retired a bundle before its result was ready");
+        check(::loadAsset(oldA, nullptr, nullptr) == beforeAsync, "Asset read during async switch lost the previous resource");
+        auto afterAsync = static_cast<fixture::Bundle*>(::getBundle(switching));
+        check(afterAsync && afterAsync->file == fourth.parent_path() / L"changed.ab", "Duplicate async load did not recover the replacement");
+        check(::getBundle(switching) == afterAsync, "Repeated async result access returned a failed or stale bundle");
+        ::unload(beforeAsync, true);
+        check(!afterAsync->unloaded && !afterAsync->destroyed, "Async replacement was destroyed by old-wrapper cleanup");
+        ::unload(afterAsync, false);
+        auto reopened = static_cast<fixture::Bundle*>(::loadSync(name(a), 0, 0));
+        check(reopened && reopened != afterAsync && !reopened->unloaded, "Reopening an unchanged route reused an unloaded bundle");
+        auto failed = patch(L"load-failure", a); send(failed);
+        fixture::rejectedFile = ark::normalized(failed.parent_path() / L"changed.ab");
+        auto restored = static_cast<fixture::Bundle*>(::loadAsset(oldA, nullptr, nullptr));
+        check(restored && !restored->unloaded && restored->file == fourth.parent_path() / L"changed.ab", "Failed replacement did not restore readable previous resources");
+        fixture::rejectedFile.clear();
+        check(static_cast<fixture::Bundle*>(::loadAsset(oldA, nullptr, nullptr))->file == failed.parent_path() / L"changed.ab", "Failed replacement could not be retried");
         check(send(patch(L"invalid", a, false, true)).find("\"success\":false") != std::string::npos, "Corrupt patch accepted");
         send(patch(L"remove", a, true));
         check(ark::normalized(static_cast<fixture::Bundle*>(::loadAsset(oldA, nullptr, nullptr))->file) == ark::normalized(a), "Disabling did not restore the original bundle");
